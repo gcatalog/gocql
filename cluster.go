@@ -17,6 +17,8 @@ import (
 type PoolConfig struct {
 	// HostSelectionPolicy sets the policy for selecting which host to use for a
 	// given query (default: RoundRobinHostPolicy())
+	// It is not supported to use a single HostSelectionPolicy in multiple sessions
+	// (even if you close the old session before using in a new session).
 	HostSelectionPolicy HostSelectionPolicy
 }
 
@@ -48,6 +50,7 @@ type ClusterConfig struct {
 	ProtoVersion                int
 	Timeout                     time.Duration                            // connection timeout (default: 600ms)
 	ConnectTimeout              time.Duration                            // initial connection timeout, used during initial dial to server (default: 600ms)
+	WriteTimeout                time.Duration                            // timeout for writing a query. defaults to Timeout if not specified.
 	Port                        int                                      // port (default: 9042)
 	Keyspace                    string                                   // initial keyspace (optional)
 	NumConns                    int                                      // number of connections per host (default: 2)
@@ -63,9 +66,9 @@ type ClusterConfig struct {
 	MaxRoutingKeyInfo           int                                      // Sets the maximum cache size for query info about statements for each session (default: 1000)
 	PageSize                    int                                      // Default page size to use for created sessions (default: 5000)
 	SerialConsistency           SerialConsistency                        // Sets the consistency for the serial part of queries, values can be either SERIAL or LOCAL_SERIAL (default: unset)
-	SslOpts                     *SslOptions                              // SSlOpts to use for this cluster. Ignored if SecureConnectBundleFilename is set.
 	SecureConnectBundleFilename string                                   // Sets the Secure Connect Bundle
-	DefaultTimestamp            bool                                     // Sends a client side timestamp for all requests which overrides the timestamp at which it arrives at the server. (default: true, only enabled for protocol 3 and above)
+	SslOpts                     *SslOptions
+	DefaultTimestamp            bool // Sends a client side timestamp for all requests which overrides the timestamp at which it arrives at the server. (default: true, only enabled for protocol 3 and above)
 	// PoolConfig configures the underlying connection pool, allowing the
 	// configuration of host selection and connection selection policies.
 	PoolConfig PoolConfig
@@ -136,6 +139,10 @@ type ClusterConfig struct {
 	// Use it to collect metrics / stats from frames by providing an implementation of FrameHeaderObserver.
 	FrameHeaderObserver FrameHeaderObserver
 
+	// StreamObserver will be notified of stream state changes.
+	// This can be used to track in-flight protocol requests and responses.
+	StreamObserver StreamObserver
+
 	// Default idempotence for queries
 	DefaultIdempotence bool
 
@@ -149,6 +156,10 @@ type ClusterConfig struct {
 	// Dialer will be used to establish all connections created for this Cluster.
 	// If not provided, a default dialer configured with ConnectTimeout will be used.
 	Dialer Dialer
+
+	// Logger for this ClusterConfig.
+	// If not specified, defaults to the global gocql.Logger.
+	Logger StdLogger
 
 	// internal config for testing
 	disableControlConn bool
@@ -196,6 +207,13 @@ func NewClusterSecureConnectBundle(connectBundleFilename string) *ClusterConfig 
 	return cfg
 }
 
+func (cfg *ClusterConfig) logger() StdLogger {
+	if cfg.Logger == nil {
+		return Logger
+	}
+	return cfg.Logger
+}
+
 // CreateSession initializes the cluster based on this config and returns a
 // session object that can be used to interact with the database.
 func (cfg *ClusterConfig) CreateSession() (*Session, error) {
@@ -207,13 +225,12 @@ func (cfg *ClusterConfig) CreateSession() (*Session, error) {
 // and port, If no AddressTranslator or if an error occurs, the given address and
 // port will be returned.
 func (cfg *ClusterConfig) translateAddressPort(addr net.IP, port int) (net.IP, int) {
-	// Do not do translations on secure connect bundle. It is handled automatically by sni processing.
 	if cfg.SecureConnectBundleFilename != "" || cfg.AddressTranslator == nil || len(addr) == 0 {
 		return addr, port
 	}
 	newAddr, newPort := cfg.AddressTranslator.Translate(addr, port)
 	if gocqlDebug {
-		Logger.Printf("gocql: translating address '%v:%d' to '%v:%d'", addr, port, newAddr, newPort)
+		cfg.logger().Printf("gocql: translating address '%v:%d' to '%v:%d'", addr, port, newAddr, newPort)
 	}
 	return newAddr, newPort
 }

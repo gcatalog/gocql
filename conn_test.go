@@ -1,6 +1,7 @@
 // Copyright (c) 2012 The gocql Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
+//go:build all || unit
 // +build all unit
 
 package gocql
@@ -33,12 +34,14 @@ const (
 
 func TestApprove(t *testing.T) {
 	tests := map[bool]bool{
-		approve("org.apache.cassandra.auth.PasswordAuthenticator"):          true,
-		approve("com.instaclustr.cassandra.auth.SharedSecretAuthenticator"): true,
-		approve("com.datastax.bdp.cassandra.auth.DseAuthenticator"):         true,
-		approve("io.aiven.cassandra.auth.AivenAuthenticator"):               true,
-		approve("com.amazon.helenus.auth.HelenusAuthenticator"):             true,
-		approve("com.apache.cassandra.auth.FakeAuthenticator"):              false,
+		approve("org.apache.cassandra.auth.PasswordAuthenticator", []string{}):                                          true,
+		approve("com.instaclustr.cassandra.auth.SharedSecretAuthenticator", []string{}):                                 true,
+		approve("com.datastax.bdp.cassandra.auth.DseAuthenticator", []string{}):                                         true,
+		approve("io.aiven.cassandra.auth.AivenAuthenticator", []string{}):                                               true,
+		approve("com.amazon.helenus.auth.HelenusAuthenticator", []string{}):                                             true,
+		approve("com.apache.cassandra.auth.FakeAuthenticator", []string{}):                                              false,
+		approve("com.apache.cassandra.auth.FakeAuthenticator", nil):                                                     false,
+		approve("com.apache.cassandra.auth.FakeAuthenticator", []string{"com.apache.cassandra.auth.FakeAuthenticator"}): true,
 	}
 	for k, v := range tests {
 		if k != v {
@@ -151,10 +154,6 @@ func newTestSession(proto protoVersion, addresses ...string) (*Session, error) {
 
 func TestDNSLookupConnected(t *testing.T) {
 	log := &testLogger{}
-	Logger = log
-	defer func() {
-		Logger = &defaultLogger{}
-	}()
 
 	// Override the defaul DNS resolver and restore at the end
 	failDNS = true
@@ -164,6 +163,7 @@ func TestDNSLookupConnected(t *testing.T) {
 	defer srv.Stop()
 
 	cluster := NewCluster("cassandra1.invalid", srv.Address, "cassandra2.invalid")
+	cluster.Logger = log
 	cluster.ProtoVersion = int(defaultProto)
 	cluster.disableControlConn = true
 
@@ -181,16 +181,13 @@ func TestDNSLookupConnected(t *testing.T) {
 
 func TestDNSLookupError(t *testing.T) {
 	log := &testLogger{}
-	Logger = log
-	defer func() {
-		Logger = &defaultLogger{}
-	}()
 
 	// Override the defaul DNS resolver and restore at the end
 	failDNS = true
 	defer func() { failDNS = false }()
 
 	cluster := NewCluster("cassandra1.invalid", "cassandra2.invalid")
+	cluster.Logger = log
 	cluster.ProtoVersion = int(defaultProto)
 	cluster.disableControlConn = true
 
@@ -213,10 +210,6 @@ func TestDNSLookupError(t *testing.T) {
 func TestStartupTimeout(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	log := &testLogger{}
-	Logger = log
-	defer func() {
-		Logger = &defaultLogger{}
-	}()
 
 	srv := NewTestServer(t, defaultProto, ctx)
 	defer srv.Stop()
@@ -226,6 +219,7 @@ func TestStartupTimeout(t *testing.T) {
 
 	startTime := time.Now()
 	cluster := NewCluster(srv.Address)
+	cluster.Logger = log
 	cluster.ProtoVersion = int(defaultProto)
 	cluster.disableControlConn = true
 	// Set very long query connection timeout
@@ -323,13 +317,14 @@ func TestCancel(t *testing.T) {
 type testQueryObserver struct {
 	metrics map[string]*hostMetrics
 	verbose bool
+	logger  StdLogger
 }
 
 func (o *testQueryObserver) ObserveQuery(ctx context.Context, q ObservedQuery) {
 	host := q.Host.ConnectAddress().String()
 	o.metrics[host] = q.Metrics
 	if o.verbose {
-		Logger.Printf("Observed query %q. Returned %v rows, took %v on host %q with %v attempts and total latency %v. Error: %q\n",
+		o.logger.Printf("Observed query %q. Returned %v rows, took %v on host %q with %v attempts and total latency %v. Error: %q\n",
 			q.Statement, q.Rows, q.End.Sub(q.Start), host, q.Metrics.Attempts, q.Metrics.TotalLatency, q.Err)
 	}
 }
@@ -383,9 +378,7 @@ func TestQueryRetry(t *testing.T) {
 
 func TestQueryMultinodeWithMetrics(t *testing.T) {
 	log := &testLogger{}
-	Logger = log
 	defer func() {
-		Logger = &defaultLogger{}
 		os.Stdout.WriteString(log.String())
 	}()
 
@@ -412,7 +405,7 @@ func TestQueryMultinodeWithMetrics(t *testing.T) {
 
 	// 1 retry per host
 	rt := &SimpleRetryPolicy{NumRetries: 3}
-	observer := &testQueryObserver{metrics: make(map[string]*hostMetrics), verbose: false}
+	observer := &testQueryObserver{metrics: make(map[string]*hostMetrics), verbose: false, logger: log}
 	qry := db.Query("kill").RetryPolicy(rt).Observer(observer)
 	if err := qry.Exec(); err == nil {
 		t.Fatalf("expected error")
@@ -460,9 +453,7 @@ func (t *testRetryPolicy) GetRetryType(err error) RetryType {
 
 func TestSpeculativeExecution(t *testing.T) {
 	log := &testLogger{}
-	Logger = log
 	defer func() {
-		Logger = &defaultLogger{}
 		os.Stdout.WriteString(log.String())
 	}()
 
@@ -678,17 +669,21 @@ func TestStream0(t *testing.T) {
 	const expErr = "gocql: received unexpected frame on stream 0"
 
 	var buf bytes.Buffer
-	f := newFramer(nil, &buf, nil, protoVersion4)
+	f := newFramer(nil, protoVersion4)
 	f.writeHeader(0, opResult, 0)
 	f.writeInt(resultKindVoid)
-	f.wbuf[0] |= 0x80
-	if err := f.finishWrite(); err != nil {
+	f.buf[0] |= 0x80
+	if err := f.finish(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.writeTo(&buf); err != nil {
 		t.Fatal(err)
 	}
 
 	conn := &Conn{
 		r:       bufio.NewReader(&buf),
 		streams: streams.New(protoVersion4),
+		logger:  &defaultLogger{},
 	}
 
 	err := conn.recv(context.Background())
@@ -720,6 +715,55 @@ func TestContext_Timeout(t *testing.T) {
 	err = db.Query("timeout").WithContext(ctx).Exec()
 	if err != context.Canceled {
 		t.Fatalf("expected to get context cancel error: %v got %v", context.Canceled, err)
+	}
+}
+
+func TestContext_CanceledBeforeExec(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var reqCount uint64
+
+	srv := newTestServerOpts{
+		addr:     "127.0.0.1:0",
+		protocol: defaultProto,
+		recvHook: func(f *framer) {
+			if f.header.op == opStartup || f.header.op == opOptions {
+				// ignore statup and heartbeat messages
+				return
+			}
+			atomic.AddUint64(&reqCount, 1)
+		},
+	}.newServer(t, ctx)
+
+	defer srv.Stop()
+
+	cluster := testCluster(defaultProto, srv.Address)
+	cluster.Timeout = 5 * time.Second
+	db, err := cluster.CreateSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	startupRequestCount := atomic.LoadUint64(&reqCount)
+
+	ctx, cancel = context.WithCancel(ctx)
+	cancel()
+
+	err = db.Query("timeout").WithContext(ctx).Exec()
+	if err != context.Canceled {
+		t.Fatalf("expected to get context cancel error: %v got %v", context.Canceled, err)
+	}
+
+	// Queries are executed by separate goroutine and we don't have a synchronization point that would allow us to
+	// check if a request was sent or not.
+	// Fall back to waiting a little bit.
+	time.Sleep(100 * time.Millisecond)
+
+	queryRequestCount := atomic.LoadUint64(&reqCount) - startupRequestCount
+	if queryRequestCount != 0 {
+		t.Fatalf("expected that no request is sent to server, sent %d requests", queryRequestCount)
 	}
 }
 
@@ -793,43 +837,44 @@ func TestWriteCoalescing(t *testing.T) {
 			t.Errorf("unexpected read error: %v", err)
 		}
 	}()
+	enqueued := make(chan struct{})
+	resetTimer := make(chan struct{})
 	w := &writeCoalescer{
+		writeCh: make(chan writeRequest),
 		c:       client,
-		writeCh: make(chan struct{}),
-		cond:    sync.NewCond(&sync.Mutex{}),
 		quit:    ctx.Done(),
-		running: true,
+		timeout: 500 * time.Millisecond,
+		testEnqueuedHook: func() {
+			enqueued <- struct{}{}
+		},
+		testFlushedHook: func() {
+			client.Close()
+		},
 	}
+	timerC := make(chan time.Time, 1)
+	go func() {
+		w.writeFlusherImpl(timerC, func() { resetTimer <- struct{}{} })
+	}()
 
 	go func() {
-		if _, err := w.Write([]byte("one")); err != nil {
+		if _, err := w.writeContext(context.Background(), []byte("one")); err != nil {
 			t.Error(err)
 		}
 	}()
 
 	go func() {
-		if _, err := w.Write([]byte("two")); err != nil {
+		if _, err := w.writeContext(context.Background(), []byte("two")); err != nil {
 			t.Error(err)
 		}
 	}()
 
-	bufMutex.Lock()
-	if buf.Len() != 0 {
-		t.Fatalf("expected buffer to be empty have: %v", buf.String())
-	}
-	bufMutex.Unlock()
+	<-enqueued
+	<-resetTimer
+	<-enqueued
 
-	for true {
-		w.cond.L.Lock()
-		if len(w.buffers) == 2 {
-			w.cond.L.Unlock()
-			break
-		}
-		w.cond.L.Unlock()
-	}
+	// flush
+	timerC <- time.Now()
 
-	w.flush()
-	client.Close()
 	<-done
 
 	if got := buf.String(); got != "onetwo" && got != "twoone" {
@@ -857,7 +902,7 @@ func TestWriteCoalescing_WriteAfterClose(t *testing.T) {
 	w := newWriteCoalescer(client, 0, 5*time.Millisecond, ctx.Done())
 
 	// ensure 1 write works
-	if _, err := w.Write([]byte("one")); err != nil {
+	if _, err := w.writeContext(context.Background(), []byte("one")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -871,7 +916,7 @@ func TestWriteCoalescing_WriteAfterClose(t *testing.T) {
 	cancel()
 	client.Close() // close client conn too, since server won't see the answer anyway.
 
-	if _, err := w.Write([]byte("two")); err == nil {
+	if _, err := w.writeContext(context.Background(), []byte("two")); err == nil {
 		t.Fatal("expected to get error for write after closing")
 	} else if err != io.EOF {
 		t.Fatalf("expected to get EOF got %v", err)
@@ -932,7 +977,20 @@ func TestFrameHeaderObserver(t *testing.T) {
 }
 
 func NewTestServerWithAddress(addr string, t testing.TB, protocol uint8, ctx context.Context) *TestServer {
-	laddr, err := net.ResolveTCPAddr("tcp", addr)
+	return newTestServerOpts{
+		addr:     addr,
+		protocol: protocol,
+	}.newServer(t, ctx)
+}
+
+type newTestServerOpts struct {
+	addr     string
+	protocol uint8
+	recvHook func(*framer)
+}
+
+func (nts newTestServerOpts) newServer(t testing.TB, ctx context.Context) *TestServer {
+	laddr, err := net.ResolveTCPAddr("tcp", nts.addr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -943,7 +1001,7 @@ func NewTestServerWithAddress(addr string, t testing.TB, protocol uint8, ctx con
 	}
 
 	headerSize := 8
-	if protocol > protoVersion2 {
+	if nts.protocol > protoVersion2 {
 		headerSize = 9
 	}
 
@@ -952,10 +1010,12 @@ func NewTestServerWithAddress(addr string, t testing.TB, protocol uint8, ctx con
 		Address:    listen.Addr().String(),
 		listen:     listen,
 		t:          t,
-		protocol:   protocol,
+		protocol:   nts.protocol,
 		headerSize: headerSize,
 		ctx:        ctx,
 		cancel:     cancel,
+
+		onRecv: nts.recvHook,
 	}
 
 	go srv.closeWatch()
@@ -1012,31 +1072,19 @@ type TestServer struct {
 	Address          string
 	TimeoutOnStartup int32
 	t                testing.TB
-	nreq             uint64
 	listen           net.Listener
 	nKillReq         int64
-	compressor       Compressor
 
 	protocol   byte
 	headerSize int
 	ctx        context.Context
 	cancel     context.CancelFunc
 
-	quit   chan struct{}
 	mu     sync.Mutex
 	closed bool
-}
 
-func (srv *TestServer) session() (*Session, error) {
-	return testCluster(protoVersion(srv.protocol), srv.Address).CreateSession()
-}
-
-func (srv *TestServer) host() *HostInfo {
-	hosts, err := hostInfo(srv.Address, 9042)
-	if err != nil {
-		srv.t.Fatal(err)
-	}
-	return hosts[0]
+	// onRecv is a hook point for tests, called in receive loop.
+	onRecv func(*framer)
 }
 
 func (srv *TestServer) closeWatch() {
@@ -1068,9 +1116,11 @@ func (srv *TestServer) serve() {
 					return
 				}
 
-				atomic.AddUint64(&srv.nreq, 1)
+				if srv.onRecv != nil {
+					srv.onRecv(framer)
+				}
 
-				go srv.process(framer)
+				go srv.process(conn, framer)
 			}
 		}(conn)
 	}
@@ -1108,12 +1158,13 @@ func (srv *TestServer) errorLocked(err interface{}) {
 	srv.t.Error(err)
 }
 
-func (srv *TestServer) process(f *framer) {
-	head := f.header
+func (srv *TestServer) process(conn net.Conn, reqFrame *framer) {
+	head := reqFrame.header
 	if head == nil {
 		srv.errorLocked("process frame with a nil header")
 		return
 	}
+	respFrame := newFramer(nil, reqFrame.proto)
 
 	switch head.op {
 	case opStartup:
@@ -1125,12 +1176,12 @@ func (srv *TestServer) process(f *framer) {
 				return
 			}
 		}
-		f.writeHeader(0, opReady, head.stream)
+		respFrame.writeHeader(0, opReady, head.stream)
 	case opOptions:
-		f.writeHeader(0, opSupported, head.stream)
-		f.writeShort(0)
+		respFrame.writeHeader(0, opSupported, head.stream)
+		respFrame.writeShort(0)
 	case opQuery:
-		query := f.readLongString()
+		query := reqFrame.readLongString()
 		first := query
 		if n := strings.Index(query, " "); n > 0 {
 			first = first[:n]
@@ -1138,60 +1189,65 @@ func (srv *TestServer) process(f *framer) {
 		switch strings.ToLower(first) {
 		case "kill":
 			atomic.AddInt64(&srv.nKillReq, 1)
-			f.writeHeader(0, opError, head.stream)
-			f.writeInt(0x1001)
-			f.writeString("query killed")
+			respFrame.writeHeader(0, opError, head.stream)
+			respFrame.writeInt(0x1001)
+			respFrame.writeString("query killed")
 		case "use":
-			f.writeInt(resultKindKeyspace)
-			f.writeString(strings.TrimSpace(query[3:]))
+			respFrame.writeInt(resultKindKeyspace)
+			respFrame.writeString(strings.TrimSpace(query[3:]))
 		case "void":
-			f.writeHeader(0, opResult, head.stream)
-			f.writeInt(resultKindVoid)
+			respFrame.writeHeader(0, opResult, head.stream)
+			respFrame.writeInt(resultKindVoid)
 		case "timeout":
 			<-srv.ctx.Done()
 			return
 		case "slow":
 			go func() {
-				f.writeHeader(0, opResult, head.stream)
-				f.writeInt(resultKindVoid)
-				f.wbuf[0] = srv.protocol | 0x80
+				respFrame.writeHeader(0, opResult, head.stream)
+				respFrame.writeInt(resultKindVoid)
+				respFrame.buf[0] = srv.protocol | 0x80
 				select {
 				case <-srv.ctx.Done():
 					return
 				case <-time.After(50 * time.Millisecond):
-					f.finishWrite()
+					respFrame.finish()
+					respFrame.writeTo(conn)
 				}
 			}()
 			return
 		case "speculative":
 			atomic.AddInt64(&srv.nKillReq, 1)
 			if atomic.LoadInt64(&srv.nKillReq) > 3 {
-				f.writeHeader(0, opResult, head.stream)
-				f.writeInt(resultKindVoid)
-				f.writeString("speculative query success on the node " + srv.Address)
+				respFrame.writeHeader(0, opResult, head.stream)
+				respFrame.writeInt(resultKindVoid)
+				respFrame.writeString("speculative query success on the node " + srv.Address)
 			} else {
-				f.writeHeader(0, opError, head.stream)
-				f.writeInt(0x1001)
-				f.writeString("speculative error")
+				respFrame.writeHeader(0, opError, head.stream)
+				respFrame.writeInt(0x1001)
+				respFrame.writeString("speculative error")
 				rand.Seed(time.Now().UnixNano())
 				<-time.After(time.Millisecond * 120)
 			}
 		default:
-			f.writeHeader(0, opResult, head.stream)
-			f.writeInt(resultKindVoid)
+			respFrame.writeHeader(0, opResult, head.stream)
+			respFrame.writeInt(resultKindVoid)
 		}
 	case opError:
-		f.writeHeader(0, opError, head.stream)
-		f.wbuf = append(f.wbuf, f.rbuf...)
+		respFrame.writeHeader(0, opError, head.stream)
+		respFrame.buf = append(respFrame.buf, reqFrame.buf...)
 	default:
-		f.writeHeader(0, opError, head.stream)
-		f.writeInt(0)
-		f.writeString("not supported")
+		respFrame.writeHeader(0, opError, head.stream)
+		respFrame.writeInt(0)
+		respFrame.writeString("not supported")
 	}
 
-	f.wbuf[0] = srv.protocol | 0x80
+	respFrame.buf[0] = srv.protocol | 0x80
 
-	if err := f.finishWrite(); err != nil {
+	if err := respFrame.finish(); err != nil {
+		srv.errorLocked(err)
+	}
+
+	if err := respFrame.writeTo(conn); err != nil {
 		srv.errorLocked(err)
 	}
 }
@@ -1202,9 +1258,9 @@ func (srv *TestServer) readFrame(conn net.Conn) (*framer, error) {
 	if err != nil {
 		return nil, err
 	}
-	framer := newFramer(conn, conn, nil, srv.protocol)
+	framer := newFramer(nil, srv.protocol)
 
-	err = framer.readFrame(&head)
+	err = framer.readFrame(conn, &head)
 	if err != nil {
 		return nil, err
 	}

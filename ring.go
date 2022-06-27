@@ -24,8 +24,6 @@ type ring struct {
 }
 
 func (r *ring) rrHost() *HostInfo {
-	// TODO: should we filter hosts that get used here? These hosts will be used
-	// for the control connection, should we also provide an iterator?
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	if len(r.hostList) == 0 {
@@ -61,29 +59,6 @@ func (r *ring) currentHosts() map[string]*HostInfo {
 	}
 	r.mu.RUnlock()
 	return hosts
-}
-
-func (r *ring) addHost(host *HostInfo) bool {
-	// TODO(zariel): key all host info by HostID instead of
-	// ip addresses
-	if host.invalidConnectAddr() {
-		panic(fmt.Sprintf("invalid host: %v", host))
-	}
-	ip := host.ConnectAddress().String()
-
-	r.mu.Lock()
-	if r.hosts == nil {
-		r.hosts = make(map[string]*HostInfo)
-	}
-
-	_, ok := r.hosts[ip]
-	if !ok {
-		r.hostList = append(r.hostList, host)
-	}
-
-	r.hosts[ip] = host
-	r.mu.Unlock()
-	return ok
 }
 
 func (r *ring) addOrUpdate(host *HostInfo) *HostInfo {

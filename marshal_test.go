@@ -1,9 +1,11 @@
-//+build all unit
+//go:build all || unit
+// +build all unit
 
 package gocql
 
 import (
 	"bytes"
+	"encoding/binary"
 	"math"
 	"math/big"
 	"net"
@@ -93,7 +95,14 @@ var marshalTests = []struct {
 		[]byte{0xb8, 0xe8, 0x56, 0x2c, 0xc, 0xd0},
 		[]byte{0xb8, 0xe8, 0x56, 0x2c, 0xc, 0xd0},
 		MarshalError("can not marshal []byte 6 bytes long into timeuuid, must be exactly 16 bytes long"),
-		UnmarshalError("Unable to parse UUID: UUIDs must be exactly 16 bytes long"),
+		UnmarshalError("unable to parse UUID: UUIDs must be exactly 16 bytes long"),
+	},
+	{
+		NativeType{proto: 2, typ: TypeTimeUUID},
+		[]byte{0x3d, 0xcd, 0x98, 0x0, 0xf3, 0xd9, 0x11, 0xbf, 0x86, 0xd4, 0xb8, 0xe8, 0x56, 0x2c, 0xc, 0xd0},
+		[16]byte{0x3d, 0xcd, 0x98, 0x0, 0xf3, 0xd9, 0x11, 0xbf, 0x86, 0xd4, 0xb8, 0xe8, 0x56, 0x2c, 0xc, 0xd0},
+		nil,
+		nil,
 	},
 	{
 		NativeType{proto: 2, typ: TypeInt},
@@ -1531,8 +1540,6 @@ func (c *CustomString) UnmarshalCQL(info TypeInfo, data []byte) error {
 
 type MyString string
 
-type MyInt int
-
 var typeLookupTest = []struct {
 	TypeName     string
 	ExpectedType Type
@@ -1784,8 +1791,8 @@ func TestMarshalTuple(t *testing.T) {
 				if got.A != "foo" {
 					t.Errorf("expected A string to be %v, got %v", "foo", got.A)
 				}
-				if *got.B != "" {
-					t.Errorf("expected B string to be empty, got %v", *got.B)
+				if got.B != nil {
+					t.Errorf("expected B string to be nil, got %v", *got.B)
 				}
 			},
 		},
@@ -1814,7 +1821,9 @@ func TestMarshalTuple(t *testing.T) {
 			check: func(t *testing.T, v interface{}) {
 				got := v.(*[2]*string)
 				checkString(t, "foo", *(got[0]))
-				checkString(t, "", *(got[1]))
+				if got[1] != nil {
+					t.Errorf("expected string to be nil, got %v", *got[1])
+				}
 			},
 		},
 	}
@@ -1870,7 +1879,7 @@ func TestUnmarshalTuple(t *testing.T) {
 			return
 		}
 
-		if *tmp.A != "" || *tmp.B != "foo" {
+		if tmp.A != nil || *tmp.B != "foo" {
 			t.Errorf("unmarshalTest: expected [nil, foo], got [%v, %v]", *tmp.A, *tmp.B)
 		}
 	})
@@ -1900,7 +1909,7 @@ func TestUnmarshalTuple(t *testing.T) {
 			return
 		}
 
-		if *tmp[0] != "" || *tmp[1] != "foo" {
+		if tmp[0] != nil || *tmp[1] != "foo" {
 			t.Errorf("unmarshalTest: expected [nil, foo], got [%v, %v]", *tmp[0], *tmp[1])
 		}
 	})
@@ -2171,4 +2180,67 @@ func TestReadCollectionSize(t *testing.T) {
 			}
 		})
 	}
+}
+
+func BenchmarkUnmarshalUUID(b *testing.B) {
+	b.ReportAllocs()
+	src := make([]byte, 16)
+	dst := UUID{}
+	var ti TypeInfo = NativeType{}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := unmarshalUUID(ti, src, &dst); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func TestUnmarshalUDT(t *testing.T) {
+	info := UDTTypeInfo{
+		NativeType: NativeType{proto: 4, typ: TypeUDT},
+		Name:       "myudt",
+		KeySpace:   "myks",
+		Elements: []UDTField{
+			{
+				Name: "first",
+				Type: NativeType{proto: 4, typ: TypeAscii},
+			},
+			{
+				Name: "second",
+				Type: NativeType{proto: 4, typ: TypeSmallInt},
+			},
+		},
+	}
+	data := bytesWithLength( // UDT
+		bytesWithLength([]byte("Hello")),    // first
+		bytesWithLength([]byte("\x00\x2a")), // second
+	)
+	value := map[string]interface{}{}
+	expectedErr := UnmarshalError("can not unmarshal into non-pointer map[string]interface {}")
+
+	if err := Unmarshal(info, data, value); err != expectedErr {
+		t.Errorf("(%v=>%T): %#v returned error %#v, want %#v.",
+			info, value, value, err, expectedErr)
+	}
+}
+
+// bytesWithLength concatenates all data slices and prepends the total length as uint32.
+// The length does not count the size of the uint32 used for writing the size.
+func bytesWithLength(data ...[]byte) []byte {
+	totalLen := 0
+	for i := range data {
+		totalLen += len(data[i])
+	}
+	if totalLen > math.MaxUint32 {
+		panic("total length overflows")
+	}
+	ret := make([]byte, totalLen+4)
+	binary.BigEndian.PutUint32(ret[:4], uint32(totalLen))
+	buf := ret[4:]
+	for i := range data {
+		n := copy(buf, data[i])
+		buf = buf[n:]
+	}
+	return ret
 }
